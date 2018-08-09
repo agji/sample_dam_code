@@ -1,0 +1,238 @@
+// sync callback
+function sync_dam_to_drupal(){
+
+  // start connection
+  $GLOBALS['damConnection'] = new dambridgeConnection();
+  $connection = $GLOBALS['damConnection']; // just not comfortable with globals, but need it to maintain connection across processes
+
+  if(!$connection){
+    return NULL;
+  }
+  //@todo verify that u are using correct validation on member vars
+  // get list of assets
+  $client = $connection->getDam();
+
+  $lastSync = $connection->getLastSync();
+
+  // get list of assets
+  //@todo change to get just list of asset ids
+
+  $luceneQueryString = "modificationDate:[$lastSync TO ". MAXTIME . "]";
+  // get a list of all file type ids
+  //$filetypes = $connection  //@todo rewrite
+  $assetList = fuseiq_dam_getSearchResult($luceneQueryString, $client);
+
+  if(isset($assetList) && !empty($assetList)){
+  // foreach importer push item in queue
+  $queue = DrupalQueue::get('damsync');
+  $numItems = count($assetList);
+  $i = 0;
+  foreach($assetList as $assetId){
+    // add task type information to this
+    $assetItemWrapper = new stdClass();
+    $assetItemWrapper->taskType = 'new_asset';
+    $assetItemWrapper->id = $assetId;
+    $assetItemWrapper->closeConnection = (++$i === $numItems)?true:false;
+
+    $queue->createItem($assetItemWrapper);
+  }
+
+  }
+}
+
+// Queue handler
+// @todo change $assetBean to just assetId
+function dambridge_task_handler($assetItemWrapper){
+ if(isset($assetItemWrapper->error_count) && $assetItemWrapper->error_count > NETXBRIDGE_ERROR_LIMIT){
+   // push up the erro
+ }
+        watchdog('INSIDE HANDLER', '<pre>'. print_r($assetItemWrapper, TRUE) . '</pre>', array(), WATCHDOG_ERROR);
+ $taskType = $assetItemWrapper->taskType;
+ $assetId = $assetItemWrapper->id;
+ // start connection
+ $connection = $GLOBALS['damConnection'];
+
+ if(!$connection){
+   return NULL;
+ }
+ //@todo verify that u are using correct validation on member vars
+ // get list of assets
+ $client = $connection->getDam();
+
+ $lastSync = $connection->getLastSync();
+
+ // create an empty stack to handle both asset and viewBeans
+ $beanStack = array();
+ switch ($taskType){
+   case 'new_asset': // write as no bean
+
+     // @todo remember process can run hours if not days after cache could be reset check for connection
+     // remove this segment of code and place it outside fo the switch statement -- remove sync class
+
+     // get asset bean
+     $assetBean = $client->getAssetBean($assetId);
+
+     // verify that view is webable
+     $viewNames = $assetBean->getViewNames();
+     if(!in_array($viewNames, VIEW_NAME )){
+       //throw new Exception("Missing View Name, assetID: $assetId");
+       error_log("Missing View Name, assetID: $assetId");
+       return true;
+     }
+
+     array_push($beanStack, $assetBean);
+
+       // get corresponding asset entity Info
+     $mapper = new dambridgeMapper($assetBean);
+     $assetLastSync = $mapper->getLastSyncStartDate($assetId);
+     error_log("ASSET modDate: $assetBean->modDate");
+     error_log("MY LastSync Date: $assetLastSync");
+     if($assetBean->modDate > $assetLastSync){ //@todo make sure same format
+
+       // todo verify that importer function is returning correct value get asset importer field information
+       $assetImporter = $mapper->get_dambridge_importer();
+
+       // get view sync pattern
+       $pattern = variable_get('dambridge_viewSync', '');
+
+       if(!empty($pattern)){
+         // get all views cooresponding to the asset
+         $viewBeans = $client->getViewObjectsForAsset($assetId);
+         // TEMPORARY SOLUTION FOR ONLY LOOKING FOR WEB VIEW
+         foreach($viewBeans as $viewBean){
+           if($viewBean->name == VIEW_NAME)
+             array_merge($beanStack, $viewBean);
+         }
+         //array_merge($beanStack, $viewBeans); //@todo: temporary fix to handle only one view name
+
+       }
+
+       $targetEntityInfoList = $mapper->getEntityInfoList($assetId); //@todo create entity if not exists:  list of all entities with same assetId
+       if(!empty($targetEntityInfoList)){
+         foreach($targetEntityInfoList as $targetEntityInfo){
+           // check to replace asset file with view file
+           //@todo rewrite if statement to inside assetBean case after views work
+           if(!variable_get('dambridge_viewSync', '')){
+             //@todo after Dam fixes API -- this is where the check for views will go
+
+
+             // pop from bean stack
+             $bean = array_shift($beanStack);
+             //check if bean is view or asset
+             $beantype = get_class($bean);
+             switch($beantype){
+               case 'AssetBean':
+                 //verify that you are only updating asset Entity, not entities created by its view
+  //               $pattern = '/^(view)/i'; wrong
+  //               if(!preg_match($pattern, $targetEntityInfo->drupal_fieldname)){
+                 //@todo verify Dates are same format
+                 if(!$targetEntityInfo->view && $targetEntityInfo->syncFinish < $bean->getModDate()){
+                   // get queue
+                   $queue = DrupalQueue::get('damsync');
+                   // create new mapperItem
+                   $mapperItem = new stdClass();
+                   $mapperItem->targetEntityInfo = $targetEntityInfo;
+                   $mapperItem->bean = $bean;
+                   $mapperItem->beans = $beanStack; // TEMPORARY SOLUTION AGAIN
+                   $mapperItem->viewbean = array_shift($beanStack); // temporary fix
+                   $mapperItem->beanType = 'asset bean';
+                   $mapperItem->error_count = 0;
+                   $mapperItem->taskType = 'getter';
+                   $queue->createItem($mapperItem);
+                 }
+                 break;
+               case 'ViewBean':
+                 //@todo write this when beans are fixed
+
+
+                 break;
+             }
+           }
+         }
+       }
+     }
+     break;
+     // handle the rest of the beans in the stack either by creating new entity as needed or ignoring sync
+     // loop through all views
+
+      // @todo verify entity is created -- should be created on dambridgeMapper Instance creation
+
+
+   case 'getter':
+     // have asset info, entity info get file, sync and save file
+     $beanType = $assetItemWrapper->beanType;
+     if(isset($assetItemWrapper) && $assetItemWrapper->error > 3){
+       //@todo write error to display and return;
+     }
+
+     if($beanType == 'asset bean'){
+       //@todo rewrite the getAssetFile function to output string -- tested hack returns status ok
+       $assetItemWrapper->setDamLastSyncStartTime();
+
+       $file = $client->getAssetFile($assetId);
+
+
+       // verify that file is downloaded
+       if($file){
+         if($file->num_rows == 1){
+
+           // record the file get end time
+
+           $assetItemWrapper->setDamLastSyncEndTime();
+           // save file @todo wrap in try catch and verify file is being writtern
+
+           $path = 'public://';
+           $path = drupal_realpath($path);
+           $fh = fopen($path, "w");
+           fwrite($fh, $file);
+           fclose($fh);
+           $assetItemWrapper->drupal_file_path = $path;
+           // create mapper push
+           $mapperItem->taskType = 'mapper';
+           $queue->createItem($mapperItem);
+         }
+       }else{
+         // output error and repush into stack
+         // get queue
+         $queue = DrupalQueue::get('damsync');
+         $assetItemWrapper->error_count++;
+         $assetItemWrapper->error = "Unable to get Asset File";
+         $queue->createItem($assetItemWrapper);
+
+
+       }
+     } else{
+       // VIew Bean ignore and comeback to after api works
+     }
+
+     // get all attributes of the assetbean
+     // create new mapper instance
+     // map all the attributes to the new entities
+     // save entity
+
+
+     break;
+   
+   case 'mapper':
+     if(isset($assetItemWrapper->drupal_file_path)){ //assuming that every asset has a file path. double check this
+       // assume entity is created & file is newer than sync time
+       // just update
+       // get a list of all the fields that are mapped, map the bean to the fields
+       $mapper = new dambridgeMapper($assetItemWrapper, VIEW_NAME);
+       $mapper->setAssetFilePath($assetItemWrapper->drupal_file_path);
+       $mapper->get_dambridge_mapped_fields();
+       // map each dam field to cooresponding drupal field
+       $mapper->map();
+
+
+       //(isset($assetItemWrapper->targetEntityInfo))?$mapper->map($assetItemWrapper->bean):$mapper->map($assetItemWrapper->bean, $assetItemWrapper->targetEntityInfo);
+       // load corresponding mapper
+       // call corresponding handler
+     }
+     // else
+     // update the data in the node
+
+     break;
+
+ }
+}
